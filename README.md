@@ -55,7 +55,7 @@ The system is designed as a **Modular Monolith**:
 ## 3. Implementation Status
 
 - [x] **Task 0.1:** Git repository initialized, `.gitignore` configured, documentation persisted.
-- [ ] **Task 0.2:** Project environment and dependencies (`pyproject.toml`, `.env.example`).
+- [x] **Task 0.2:** Project environment and dependencies (`pyproject.toml`, `.env.example`, `.venv`).
 - [ ] **Task 0.3:** Directory scaffolding and ADRs.
 - [ ] **Task 0.4:** Core domain models (`Decimal` precision, immutable).
 - [ ] **Task 0.5:** Typed configuration schemas and validation.
