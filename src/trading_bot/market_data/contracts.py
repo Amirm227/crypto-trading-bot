@@ -13,17 +13,20 @@ from trading_bot.domain.candle import Candle
 from trading_bot.domain.types import (
     DomainModel,
     FinancialDecimal,
+    MarketType,
     TimeFrame,
     UTCDateTime,
 )
 
 SUPPORTED_BASE_ASSETS: frozenset[str] = frozenset({"BTC", "ETH", "SOL"})
 SUPPORTED_SPOT_SYMBOLS: frozenset[str] = frozenset({"BTC/USDT", "ETH/USDT", "SOL/USDT"})
-SUPPORTED_FUTURES_SYMBOLS: frozenset[str] = frozenset({
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "SOL/USDT:USDT",
-})
+SUPPORTED_FUTURES_SYMBOLS: frozenset[str] = frozenset(
+    {
+        "BTC/USDT:USDT",
+        "ETH/USDT:USDT",
+        "SOL/USDT:USDT",
+    }
+)
 SUPPORTED_SYMBOLS: frozenset[str] = frozenset(SUPPORTED_SPOT_SYMBOLS | SUPPORTED_FUTURES_SYMBOLS)
 SUPPORTED_TIMEFRAMES: frozenset[TimeFrame] = frozenset({TimeFrame.H1, TimeFrame.H4})
 
@@ -55,9 +58,7 @@ class OHLCVRequest(DomainModel):
             )
 
         if self.timeframe not in SUPPORTED_TIMEFRAMES:
-            raise ValueError(
-                f"Unsupported timeframe '{self.timeframe}'. Must be 1h or 4h for MVP"
-            )
+            raise ValueError(f"Unsupported timeframe '{self.timeframe}'. Must be 1h or 4h for MVP")
 
         if self.since is not None and self.until is not None and self.since >= self.until:
             raise ValueError(
@@ -88,6 +89,7 @@ class RawCandle(DomainModel):
         exchange: str,
         symbol: str,
         timeframe: TimeFrame,
+        market_type: MarketType | None = None,
         ingested_at: datetime | None = None,
     ) -> Candle:
         """Transform raw candle DTO into fully validated domain Candle."""
@@ -96,9 +98,18 @@ class RawCandle(DomainModel):
         cl_time = op_time + duration
         ingest_time = ingested_at or datetime.now(UTC)
 
+        m_type = market_type
+        if m_type is None:
+            m_type = (
+                MarketType.FUTURES
+                if (":" in symbol or symbol in SUPPORTED_FUTURES_SYMBOLS)
+                else MarketType.SPOT
+            )
+
         return Candle(
             exchange=exchange,
             symbol=symbol,
+            market_type=m_type,
             timeframe=timeframe,
             open_time=op_time,
             close_time=cl_time,
@@ -126,6 +137,7 @@ class CandleBatch(DomainModel):
 
         symbol = self.symbol
         timeframe = self.timeframe
+        batch_market_type = self.candles[0].market_type
 
         for i, c in enumerate(self.candles):
             if c.symbol != symbol:
@@ -136,6 +148,10 @@ class CandleBatch(DomainModel):
                 raise ValueError(
                     f"Candle at index {i} has timeframe '{c.timeframe}', expected '{timeframe}'"
                 )
+            if c.market_type != batch_market_type:
+                raise ValueError(
+                    f"Candle at index {i} has market_type '{c.market_type}', expected '{batch_market_type}'"
+                )
 
             # Check timestamp ordering
             if i > 0:
@@ -143,7 +159,7 @@ class CandleBatch(DomainModel):
                 if c.open_time <= prev_c.open_time:
                     raise ValueError(
                         f"Candles not in strictly ascending order: index {i} ({c.open_time}) "
-                        f"<= index {i-1} ({prev_c.open_time})"
+                        f"<= index {i - 1} ({prev_c.open_time})"
                     )
 
             # Incomplete candle check: only the very last candle can be incomplete
@@ -154,6 +170,10 @@ class CandleBatch(DomainModel):
                 )
 
         return self
+
+    @property
+    def market_type(self) -> MarketType:
+        return self.candles[0].market_type
 
     @property
     def count(self) -> int:

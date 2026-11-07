@@ -63,6 +63,7 @@ class DatabaseConfig(DomainModel):
     port: int = Field(default=5432, ge=1, le=65535)
     name: str = "trading_bot"
     user: str = "postgres"
+    password: str = "placeholder_db_password"
     ssl_mode: str = "prefer"
 
     @model_validator(mode="after")
@@ -72,6 +73,11 @@ class DatabaseConfig(DomainModel):
         if not self.user.strip():
             raise ValueError("database user must not be empty")
         return self
+
+    def get_url(self, password: str | None = None) -> str:
+        """Construct PostgreSQL asyncpg connection URL."""
+        pwd = password if password is not None else self.password
+        return f"postgresql+asyncpg://{self.user}:{pwd}@{self.host}:{self.port}/{self.name}"
 
 
 class MonitoringConfig(DomainModel):
@@ -399,6 +405,8 @@ class EnvSettings(BaseSettings):
     db_port: int = 5432
     db_name: str = "trading_bot"
     db_user: str = "postgres"
+    db_password: str = "placeholder_db_password"
+    database_url: str | None = None
     exchange_id: str = "binance"
     exchange_sandbox: bool = True
     enable_live_trading: bool = False

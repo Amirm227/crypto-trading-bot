@@ -49,7 +49,7 @@ def test_required_test_directories_exist() -> None:
 
 
 def test_documentation_and_adrs_complete() -> None:
-    """Ensure canonical documentation and all 7 ADRs are present and properly structured."""
+    """Ensure canonical documentation and all ADRs are present and properly structured."""
     docs_dir = Path("docs")
     assert (docs_dir / "ARCHITECTURE.md").exists()
     assert (docs_dir / "STRATEGIES.md").exists()
@@ -69,6 +69,7 @@ def test_documentation_and_adrs_complete() -> None:
         "ADR-005-shared-strategy-core.md",
         "ADR-006-fail-closed-risk-policy.md",
         "ADR-007-paper-before-live.md",
+        "ADR-008-composite-candle-key.md",
     ]
 
     required_sections = [

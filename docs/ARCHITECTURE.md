@@ -172,7 +172,7 @@ flowchart TD
 
 - Store all timestamps in UTC.
 - Store sensitive prices, quantities, Fees, and PnL using Decimal.
-- The unique Candle key is `(exchange, symbol, timeframe, open_time)`.
+- The unique Candle key is (exchange, symbol, market_type, timeframe, open_time) (refined per ADR-008 to support both Spot and Futures market data without key collision).
 - Historical data must not be silently replaced with corrected data.
 - Physical deletion of Orders/Trades is prohibited; corrections must be recorded as events.
 - Maintain a Correlation ID for every decision cycle.

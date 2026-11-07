@@ -231,9 +231,16 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
             candle_close_time = raw_candle.open_time + duration
             is_closed = candle_close_time <= server_time
 
+            market_type = (
+                MarketType.FUTURES
+                if request.symbol in SUPPORTED_FUTURES_SYMBOLS
+                else MarketType.SPOT
+            )
+
             domain_candle = Candle(
                 exchange=self._exchange_id,
                 symbol=request.symbol,
+                market_type=market_type,
                 timeframe=request.timeframe,
                 open_time=raw_candle.open_time,
                 close_time=candle_close_time,

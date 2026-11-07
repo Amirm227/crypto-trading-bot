@@ -1,12 +1,14 @@
 """Candle domain model with strict mathematical OHLCV integrity checks."""
 
 from decimal import Decimal
+from typing import Any
 
 from pydantic import model_validator
 
 from trading_bot.domain.types import (
     DomainModel,
     FinancialDecimal,
+    MarketType,
     TimeFrame,
     UTCDateTime,
 )
@@ -17,6 +19,7 @@ class Candle(DomainModel):
 
     exchange: str
     symbol: str
+    market_type: MarketType = MarketType.SPOT
     timeframe: TimeFrame
     open_time: UTCDateTime
     close_time: UTCDateTime
@@ -27,6 +30,18 @@ class Candle(DomainModel):
     volume: FinancialDecimal
     is_closed: bool
     ingested_at: UTCDateTime
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_market_type_default(cls, data: Any) -> Any:
+        """Infer or default market_type if omitted, preserving backwards compatibility."""
+        if isinstance(data, dict) and "market_type" not in data:
+            symbol = data.get("symbol", "")
+            if symbol and (":" in symbol or symbol.endswith(":USDT")):
+                data["market_type"] = MarketType.FUTURES
+            else:
+                data["market_type"] = MarketType.SPOT
+        return data
 
     @model_validator(mode="after")
     def validate_ohlcv_integrity(self) -> "Candle":
