@@ -303,10 +303,28 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
         amount_limits = limits.get("amount") if isinstance(limits.get("amount"), dict) else {}
 
         cost_min_val = cost_limits.get("min")
-        cost_min = _to_decimal(cost_min_val) if cost_min_val is not None else Decimal("5.0")
+        if cost_min_val is None:
+            raise ExchangeDataError(
+                f"Market metadata for {symbol} is missing required 'limits.cost.min' constraint"
+            )
+        cost_min = _to_decimal(cost_min_val)
 
         amount_min_val = amount_limits.get("min")
-        amount_min = _to_decimal(amount_min_val) if amount_min_val is not None else step_size
+        if amount_min_val is None:
+            raise ExchangeDataError(
+                f"Market metadata for {symbol} is missing required 'limits.amount.min' constraint"
+            )
+        amount_min = _to_decimal(amount_min_val)
+
+        # Validate market type from CCXT market metadata
+        is_spot = market_info.get("spot") is True or market_info.get("type") == "spot"
+        if not is_spot:
+            market_type_str = market_info.get("type") or "non-spot"
+            raise ExchangeDataError(
+                f"Market '{symbol}' has unsupported market type '{market_type_str}'. "
+                "ReadOnlyCCXTAdapter currently only supports spot markets."
+            )
+        market_type = MarketType.SPOT
 
         contract_size_val = market_info.get("contractSize")
         contract_size = (
@@ -317,7 +335,7 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
             symbol=symbol,
             base_asset=base_asset,
             quote_asset=quote_asset,
-            market_type=MarketType.SPOT,
+            market_type=market_type,
             price_precision=price_prec,
             quantity_precision=qty_prec,
             min_notional=cost_min,
@@ -332,8 +350,8 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
 
         In this read-only adapter, all trading and margin execution capabilities
         are strictly UNSUPPORTED to reflect operational reality and safety guarantees.
-        Only genuinely available public data feeds (OHLCV retrieval and funding history)
-        are marked SUPPORTED.
+        Historical funding rate retrieval is also UNSUPPORTED (only current funding rate
+        ticker query is available). Only public OHLCV retrieval is marked SUPPORTED.
         """
         self._ensure_open()
         return ExchangeCapabilities(
@@ -345,7 +363,7 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
             reduce_only=CapabilityStatus.UNSUPPORTED,
             stop_market=CapabilityStatus.UNSUPPORTED,
             take_profit_market=CapabilityStatus.UNSUPPORTED,
-            funding_history=CapabilityStatus.SUPPORTED,
+            funding_history=CapabilityStatus.UNSUPPORTED,
             ohlcv_fetch=CapabilityStatus.SUPPORTED,
         )
 
@@ -355,17 +373,44 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
         if symbol not in SUPPORTED_SYMBOLS:
             raise ExchangeDataError(f"Unsupported symbol: '{symbol}'")
 
+        if not hasattr(self._client, "fetch_funding_rate"):
+            raise ExchangeDataError(
+                f"Exchange client '{self._exchange_id}' does not support fetch_funding_rate"
+            )
+
         try:
-            funding_rate = Decimal("0.0001")  # default baseline
-            if hasattr(self._client, "fetch_funding_rate"):
-                res = await self._client.fetch_funding_rate(symbol)
-                if res and "fundingRate" in res and res["fundingRate"] is not None:
-                    funding_rate = _to_decimal(res["fundingRate"])
-            return funding_rate
+            res = await self._client.fetch_funding_rate(symbol)
+        except ccxt.RateLimitExceeded as e:
+            raise ExchangeRateLimitError(
+                f"Rate limit exceeded while fetching funding rate for {symbol}: {e}"
+            ) from e
+        except ccxt.RequestTimeout as e:
+            raise ExchangeTimeoutError(
+                f"Timeout while fetching funding rate for {symbol}: {e}"
+            ) from e
+        except ccxt.NetworkError as e:
+            raise ExchangeNetworkError(
+                f"Network error while fetching funding rate for {symbol}: {e}"
+            ) from e
         except (ExchangeDataError, ExchangeAdapterError):
             raise
         except Exception as e:
-            raise ExchangeAdapterError(f"Failed to fetch funding rate for {symbol}: {e}") from e
+            raise ExchangeAdapterError(
+                f"Failed to fetch funding rate for {symbol}: {e}"
+            ) from e
+
+        if not res or not isinstance(res, dict):
+            raise ExchangeDataError(
+                f"Exchange returned empty or malformed funding rate response for {symbol}: {res!r}"
+            )
+
+        if "fundingRate" not in res or res["fundingRate"] is None:
+            raise ExchangeDataError(
+                f"Funding rate missing or None in exchange response for {symbol}: {res!r}"
+            )
+
+        return _to_decimal(res["fundingRate"])
+
 
     # STRICT SAFETY GATES — PRIVATE OPERATIONS AND TRADING STRICTLY PROHIBITED
     async def get_balance(self) -> dict[str, FinancialDecimal]:
