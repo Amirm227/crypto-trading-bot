@@ -1,0 +1,2 @@
+# Database schema migrations directory (Alembic)
+# Migration scripts will be populated during persistence implementation.
