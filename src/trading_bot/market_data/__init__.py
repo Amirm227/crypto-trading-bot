@@ -2,6 +2,8 @@
 
 from trading_bot.market_data.contracts import (
     SUPPORTED_BASE_ASSETS,
+    SUPPORTED_FUTURES_SYMBOLS,
+    SUPPORTED_SPOT_SYMBOLS,
     SUPPORTED_SYMBOLS,
     SUPPORTED_TIMEFRAMES,
     TIMEFRAME_DURATIONS,
@@ -16,6 +18,8 @@ from trading_bot.market_data.contracts import (
 
 __all__ = [
     "SUPPORTED_BASE_ASSETS",
+    "SUPPORTED_FUTURES_SYMBOLS",
+    "SUPPORTED_SPOT_SYMBOLS",
     "SUPPORTED_SYMBOLS",
     "SUPPORTED_TIMEFRAMES",
     "TIMEFRAME_DURATIONS",

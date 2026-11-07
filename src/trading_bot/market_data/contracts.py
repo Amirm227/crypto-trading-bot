@@ -18,7 +18,13 @@ from trading_bot.domain.types import (
 )
 
 SUPPORTED_BASE_ASSETS: frozenset[str] = frozenset({"BTC", "ETH", "SOL"})
-SUPPORTED_SYMBOLS: frozenset[str] = frozenset({"BTC/USDT", "ETH/USDT", "SOL/USDT"})
+SUPPORTED_SPOT_SYMBOLS: frozenset[str] = frozenset({"BTC/USDT", "ETH/USDT", "SOL/USDT"})
+SUPPORTED_FUTURES_SYMBOLS: frozenset[str] = frozenset({
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+})
+SUPPORTED_SYMBOLS: frozenset[str] = frozenset(SUPPORTED_SPOT_SYMBOLS | SUPPORTED_FUTURES_SYMBOLS)
 SUPPORTED_TIMEFRAMES: frozenset[TimeFrame] = frozenset({TimeFrame.H1, TimeFrame.H4})
 
 TIMEFRAME_DURATIONS: dict[TimeFrame, timedelta] = {

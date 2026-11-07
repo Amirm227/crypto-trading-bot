@@ -42,7 +42,7 @@ def mock_client() -> AsyncMock:
     client.number = Decimal
     # Mock server time: 2026-11-07 12:00:00 UTC
     client.fetch_time.return_value = 1794052800000
-    # Mock markets
+    # Mock markets (default BTC spot)
     client.load_markets.return_value = {
         "BTC/USDT": {
             "symbol": "BTC/USDT",
@@ -52,7 +52,22 @@ def mock_client() -> AsyncMock:
             "type": "spot",
             "precision": {"price": 2, "amount": 5},
             "limits": {"cost": {"min": Decimal("5.0")}, "amount": {"min": Decimal("0.00001")}},
-        }
+        },
+        "BTC/USDT:USDT": {
+            "symbol": "BTC/USDT:USDT",
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDT",
+            "spot": False,
+            "swap": True,
+            "linear": True,
+            "inverse": False,
+            "type": "swap",
+            "contract": True,
+            "contractSize": Decimal("1.0"),
+            "precision": {"price": 1, "amount": 3},
+            "limits": {"cost": {"min": Decimal("5.0")}, "amount": {"min": Decimal("0.001")}},
+        },
     }
     client.fetch_funding_rate.return_value = {"fundingRate": Decimal("0.0001")}
     return client
@@ -77,7 +92,7 @@ async def test_get_server_time_returns_utc_datetime(mock_client: AsyncMock) -> N
 
 @pytest.mark.asyncio
 async def test_fetch_ohlcv_normalizes_to_decimal_candle_batch(mock_client: AsyncMock) -> None:
-    """Ensure fetch_ohlcv preserves Decimal precision and correctly sets is_closed flag."""
+    """Ensure fetch_ohlcv preserves Decimal precision and correctly sets is_closed flag for spot."""
     # Server time is 12:00:00 UTC
     # Candle 1: 10:00:00 to 11:00:00 (Closed)
     # Candle 2: 11:00:00 to 12:00:00 (Closed)
@@ -115,14 +130,32 @@ async def test_fetch_ohlcv_normalizes_to_decimal_candle_batch(mock_client: Async
 
 
 @pytest.mark.asyncio
-async def test_get_market_metadata_normalized(mock_client: AsyncMock) -> None:
-    """Ensure get_market_metadata extracts lot sizes and precisions using Decimal."""
+async def test_fetch_ohlcv_linear_perpetual(mock_client: AsyncMock) -> None:
+    """Ensure fetch_ohlcv retrieves and normalizes linear perpetual futures candles."""
+    ts = int(datetime(2026, 11, 7, 10, 0, tzinfo=UTC).timestamp() * 1000)
+    mock_client.fetch_ohlcv.return_value = [
+        [ts, Decimal("70100.0"), Decimal("70500.0"), Decimal("69800.0"), Decimal("70250.0"), Decimal("500.0")]
+    ]
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    req = OHLCVRequest(symbol="BTC/USDT:USDT", timeframe=TimeFrame.H1)
+    batch = await adapter.fetch_ohlcv(req)
+
+    assert batch.symbol == "BTC/USDT:USDT"
+    assert batch.candles[0].open == Decimal("70100.0")
+    assert isinstance(batch.candles[0].open, Decimal)
+
+
+@pytest.mark.asyncio
+async def test_get_market_metadata_spot(mock_client: AsyncMock) -> None:
+    """Ensure get_market_metadata extracts spot lot sizes, precisions, and market type."""
     adapter = ReadOnlyCCXTAdapter(client=mock_client)
     meta = await adapter.get_market_metadata("BTC/USDT")
 
     assert isinstance(meta, MarketMetadata)
     assert meta.symbol == "BTC/USDT"
     assert meta.market_type == MarketType.SPOT
+    assert meta.base_asset == "BTC"
+    assert meta.quote_asset == "USDT"
     assert meta.price_precision == 2
     assert meta.quantity_precision == 5
     assert meta.min_notional == Decimal("5.0")
@@ -131,6 +164,25 @@ async def test_get_market_metadata_normalized(mock_client: AsyncMock) -> None:
     assert isinstance(meta.min_quantity, Decimal)
     assert meta.step_size == Decimal("0.00001")
     assert meta.tick_size == Decimal("0.01")
+
+
+@pytest.mark.asyncio
+async def test_get_market_metadata_linear_perpetual(mock_client: AsyncMock) -> None:
+    """Ensure get_market_metadata normalizes USDT-M linear perpetual contracts."""
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    meta = await adapter.get_market_metadata("BTC/USDT:USDT")
+
+    assert isinstance(meta, MarketMetadata)
+    assert meta.symbol == "BTC/USDT:USDT"
+    assert meta.market_type == MarketType.FUTURES
+    assert meta.base_asset == "BTC"
+    assert meta.quote_asset == "USDT"
+    assert meta.price_precision == 1
+    assert meta.quantity_precision == 3
+    assert meta.min_notional == Decimal("5.0")
+    assert meta.min_quantity == Decimal("0.001")
+    assert meta.step_size == Decimal("0.001")
+    assert meta.contract_size == Decimal("1.0")
 
 
 @pytest.mark.asyncio
@@ -153,12 +205,21 @@ async def test_get_exchange_capabilities(mock_client: AsyncMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_funding_rate_returns_decimal(mock_client: AsyncMock) -> None:
-    """Ensure funding rate query returns Decimal."""
+async def test_get_funding_rate_returns_decimal_for_perpetual(mock_client: AsyncMock) -> None:
+    """Ensure funding rate query returns exact Decimal for perpetual futures symbol."""
     adapter = ReadOnlyCCXTAdapter(client=mock_client)
-    rate = await adapter.get_funding_rate("BTC/USDT")
+    rate = await adapter.get_funding_rate("BTC/USDT:USDT")
     assert rate == Decimal("0.0001")
     assert isinstance(rate, Decimal)
+
+
+@pytest.mark.asyncio
+async def test_get_funding_rate_rejects_spot_symbol(mock_client: AsyncMock) -> None:
+    """Ensure funding rate query on a spot symbol is strictly rejected with ExchangeDataError."""
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    with pytest.raises(ExchangeDataError) as exc:
+        await adapter.get_funding_rate("BTC/USDT")
+    assert "only applicable to perpetual futures markets" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -317,20 +378,20 @@ async def test_get_funding_rate_error_handling(mock_client: AsyncMock) -> None:
     with pytest.raises(ExchangeDataError):
         await adapter.get_funding_rate("DOGE/USDT")
 
-    # Network error
+    # Network error on valid perpetual
     mock_client.fetch_funding_rate.side_effect = ccxt.NetworkError("Error")
     with pytest.raises(ExchangeNetworkError):
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
 
-    # Rate limit error
+    # Rate limit error on valid perpetual
     mock_client.fetch_funding_rate.side_effect = ccxt.RateLimitExceeded("Rate limit")
     with pytest.raises(ExchangeRateLimitError):
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
 
-    # Timeout error
+    # Timeout error on valid perpetual
     mock_client.fetch_funding_rate.side_effect = ccxt.RequestTimeout("Timeout")
     with pytest.raises(ExchangeTimeoutError):
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
 
 
 def test_to_decimal_handling_and_float_rejection() -> None:
@@ -553,8 +614,6 @@ async def test_get_market_metadata_tick_size_missing_precision_raises(mock_clien
     assert "missing price or amount tick_size" in str(exc.value)
 
 
-# FAIL-CLOSED METADATA CORRECTION TESTS (Items 1, 2, 4, 5)
-
 @pytest.mark.asyncio
 async def test_get_market_metadata_missing_amount_min_raises(mock_client: AsyncMock) -> None:
     """Ensure missing or None limits.amount.min raises ExchangeDataError without fallback to step_size."""
@@ -617,7 +676,7 @@ async def test_get_market_metadata_market_type_validation(mock_client: AsyncMock
     meta = await adapter.get_market_metadata("BTC/USDT")
     assert meta.market_type == MarketType.SPOT
 
-    # Future raises
+    # Delivery Future raises
     mock_client.load_markets.return_value = {
         "BTC/USDT": {
             "symbol": "BTC/USDT",
@@ -625,25 +684,77 @@ async def test_get_market_metadata_market_type_validation(mock_client: AsyncMock
             "quote": "USDT",
             "spot": False,
             "type": "future",
+            "future": True,
             "precision": {"price": 2, "amount": 5},
             "limits": {"cost": {"min": Decimal("5.0")}, "amount": {"min": Decimal("0.00001")}},
         }
     }
     with pytest.raises(ExchangeDataError) as exc_future:
         await adapter.get_market_metadata("BTC/USDT")
-    assert "unsupported market type 'future'" in str(exc_future.value)
-
-    # Swap raises
-    mock_client.load_markets.return_value["BTC/USDT"]["type"] = "swap"
-    with pytest.raises(ExchangeDataError) as exc_swap:
-        await adapter.get_market_metadata("BTC/USDT")
-    assert "unsupported market type 'swap'" in str(exc_swap.value)
+    assert "unsupported or mismatched market structure" in str(exc_future.value)
 
     # Option raises
-    mock_client.load_markets.return_value["BTC/USDT"]["type"] = "option"
+    mock_client.load_markets.return_value["BTC/USDT"] = {
+        "symbol": "BTC/USDT",
+        "base": "BTC",
+        "quote": "USDT",
+        "spot": False,
+        "type": "option",
+        "option": True,
+        "precision": {"price": 2, "amount": 5},
+        "limits": {"cost": {"min": Decimal("5.0")}, "amount": {"min": Decimal("0.00001")}},
+    }
     with pytest.raises(ExchangeDataError) as exc_opt:
         await adapter.get_market_metadata("BTC/USDT")
-    assert "unsupported market type 'option'" in str(exc_opt.value)
+    assert "unsupported or mismatched market structure" in str(exc_opt.value)
+
+
+@pytest.mark.asyncio
+async def test_get_market_metadata_rejects_inverse_contracts(mock_client: AsyncMock) -> None:
+    """Ensure inverse contracts are strictly rejected."""
+    mock_client.load_markets.return_value = {
+        "BTC/USDT:USDT": {
+            "symbol": "BTC/USDT:USDT",
+            "base": "BTC",
+            "quote": "USD",
+            "settle": "BTC",
+            "spot": False,
+            "swap": True,
+            "linear": False,
+            "inverse": True,
+            "type": "swap",
+            "precision": {"price": 1, "amount": 3},
+            "limits": {"cost": {"min": Decimal("5.0")}, "amount": {"min": Decimal("0.001")}},
+        }
+    }
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    with pytest.raises(ExchangeDataError) as exc:
+        await adapter.get_market_metadata("BTC/USDT:USDT")
+    assert "inverse contract" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_get_market_metadata_rejects_non_usdt_settle(mock_client: AsyncMock) -> None:
+    """Ensure linear perpetual with non-USDT settle asset is rejected."""
+    mock_client.load_markets.return_value = {
+        "BTC/USDT:USDT": {
+            "symbol": "BTC/USDT:USDT",
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDC",  # mismatch: settle is USDC instead of USDT
+            "spot": False,
+            "swap": True,
+            "linear": True,
+            "inverse": False,
+            "type": "swap",
+            "precision": {"price": 1, "amount": 3},
+            "limits": {"cost": {"min": Decimal("5.0")}, "amount": {"min": Decimal("0.001")}},
+        }
+    }
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    with pytest.raises(ExchangeDataError) as exc:
+        await adapter.get_market_metadata("BTC/USDT:USDT")
+    assert "unsupported or mismatched market structure" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -655,37 +766,37 @@ async def test_get_funding_rate_none_and_malformed_responses(mock_client: AsyncM
     mock_client.fetch_funding_rate.side_effect = None
     mock_client.fetch_funding_rate.return_value = None
     with pytest.raises(ExchangeDataError) as exc1:
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
     assert "empty or malformed" in str(exc1.value)
 
     # Empty dict response
     mock_client.fetch_funding_rate.return_value = {}
     with pytest.raises(ExchangeDataError) as exc2:
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
     assert "empty or malformed" in str(exc2.value)
 
     # Non-empty dict missing fundingRate key
-    mock_client.fetch_funding_rate.return_value = {"symbol": "BTC/USDT"}
+    mock_client.fetch_funding_rate.return_value = {"symbol": "BTCUSDT"}
     with pytest.raises(ExchangeDataError) as exc_missing:
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
     assert "missing or None" in str(exc_missing.value)
 
     # fundingRate is None
     mock_client.fetch_funding_rate.return_value = {"fundingRate": None}
     with pytest.raises(ExchangeDataError) as exc3:
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
     assert "missing or None" in str(exc3.value)
 
     # Malformed non-dict response
     mock_client.fetch_funding_rate.return_value = "invalid_string"
     with pytest.raises(ExchangeDataError) as exc4:
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
     assert "empty or malformed" in str(exc4.value)
 
     # Binary float response raises float rejection error
     mock_client.fetch_funding_rate.return_value = {"fundingRate": 0.0001}
     with pytest.raises(ExchangeDataError) as exc5:
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
     assert "Binary float" in str(exc5.value)
 
 
@@ -696,7 +807,7 @@ async def test_get_funding_rate_high_precision_preservation(mock_client: AsyncMo
     precise_rate = Decimal("0.000123456789012345")
     mock_client.fetch_funding_rate.return_value = {"fundingRate": precise_rate}
 
-    rate = await adapter.get_funding_rate("BTC/USDT")
+    rate = await adapter.get_funding_rate("BTC/USDT:USDT")
     assert rate == precise_rate
     assert str(rate) == "0.000123456789012345"
     assert isinstance(rate, Decimal)
@@ -708,5 +819,5 @@ async def test_get_funding_rate_client_missing_method(mock_client: AsyncMock) ->
     del mock_client.fetch_funding_rate
     adapter = ReadOnlyCCXTAdapter(client=mock_client)
     with pytest.raises(ExchangeDataError) as exc:
-        await adapter.get_funding_rate("BTC/USDT")
+        await adapter.get_funding_rate("BTC/USDT:USDT")
     assert "does not support fetch_funding_rate" in str(exc.value)

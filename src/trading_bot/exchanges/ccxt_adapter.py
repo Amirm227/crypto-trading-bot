@@ -43,6 +43,8 @@ from trading_bot.exchanges.exceptions import (
     ExchangeTimeoutError,
 )
 from trading_bot.market_data.contracts import (
+    SUPPORTED_FUTURES_SYMBOLS,
+    SUPPORTED_SPOT_SYMBOLS,
     SUPPORTED_SYMBOLS,
     SUPPORTED_TIMEFRAMES,
     TIMEFRAME_DURATIONS,
@@ -316,15 +318,39 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
             )
         amount_min = _to_decimal(amount_min_val)
 
-        # Validate market type from CCXT market metadata
-        is_spot = market_info.get("spot") is True or market_info.get("type") == "spot"
-        if not is_spot:
-            market_type_str = market_info.get("type") or "non-spot"
+        # Validate market type from CCXT market metadata and symbol conventions
+        settle_asset = market_info.get("settle")
+
+        # Reject inverse contracts immediately
+        if market_info.get("inverse") is True:
             raise ExchangeDataError(
-                f"Market '{symbol}' has unsupported market type '{market_type_str}'. "
-                "ReadOnlyCCXTAdapter currently only supports spot markets."
+                f"Market '{symbol}' is an inverse contract; only linear USDT-M contracts are supported"
             )
-        market_type = MarketType.SPOT
+
+        is_spot = (
+            (market_info.get("spot") is True or market_info.get("type") == "spot")
+            and symbol in SUPPORTED_SPOT_SYMBOLS
+        )
+        is_linear_perpetual = (
+            (market_info.get("swap") is True or market_info.get("type") == "swap")
+            and market_info.get("linear") is True
+            and quote_asset == "USDT"
+            and settle_asset == "USDT"
+            and symbol in SUPPORTED_FUTURES_SYMBOLS
+        )
+
+        if is_spot:
+            market_type = MarketType.SPOT
+        elif is_linear_perpetual:
+            market_type = MarketType.FUTURES
+        else:
+            raw_type = market_info.get("type", "unknown")
+            raise ExchangeDataError(
+                f"Market '{symbol}' has unsupported or mismatched market structure "
+                f"(type: '{raw_type}', spot: {market_info.get('spot')}, swap: {market_info.get('swap')}, "
+                f"linear: {market_info.get('linear')}, settle: '{settle_asset}'). "
+                "ReadOnlyCCXTAdapter only supports spot (USDT) and linear perpetual (USDT-M) markets."
+            )
 
         contract_size_val = market_info.get("contractSize")
         contract_size = (
@@ -370,8 +396,14 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
     async def get_funding_rate(self, symbol: str) -> FinancialDecimal:
         """Fetch latest funding rate for linear futures via public ticker endpoint."""
         self._ensure_open()
-        if symbol not in SUPPORTED_SYMBOLS:
-            raise ExchangeDataError(f"Unsupported symbol: '{symbol}'")
+        if symbol not in SUPPORTED_FUTURES_SYMBOLS:
+            if symbol in SUPPORTED_SPOT_SYMBOLS:
+                raise ExchangeDataError(
+                    f"Funding rate is only applicable to perpetual futures markets; '{symbol}' is a spot market"
+                )
+            raise ExchangeDataError(
+                f"Unsupported futures symbol: '{symbol}'. Must be one of {sorted(SUPPORTED_FUTURES_SYMBOLS)}"
+            )
 
         if not hasattr(self._client, "fetch_funding_rate"):
             raise ExchangeDataError(

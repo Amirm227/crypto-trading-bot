@@ -14,6 +14,8 @@ from trading_bot.exchanges.contracts import (
     MarketMetadata,
 )
 from trading_bot.market_data.contracts import (
+    SUPPORTED_FUTURES_SYMBOLS,
+    SUPPORTED_SPOT_SYMBOLS,
     SUPPORTED_SYMBOLS,
     SUPPORTED_TIMEFRAMES,
     CandleBatch,
@@ -52,12 +54,24 @@ def make_valid_candle(
 
 
 def test_supported_constants() -> None:
-    """Ensure supported asset and timeframe constants match specification."""
-    assert "BTC/USDT" in SUPPORTED_SYMBOLS
-    assert "ETH/USDT" in SUPPORTED_SYMBOLS
-    assert "SOL/USDT" in SUPPORTED_SYMBOLS
+    """Ensure supported asset and timeframe constants match specification for spot and futures."""
+    for spot_sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
+        assert spot_sym in SUPPORTED_SPOT_SYMBOLS
+        assert spot_sym in SUPPORTED_SYMBOLS
+
+    for fut_sym in ("BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"):
+        assert fut_sym in SUPPORTED_FUTURES_SYMBOLS
+        assert fut_sym in SUPPORTED_SYMBOLS
+
     assert TimeFrame.H1 in SUPPORTED_TIMEFRAMES
     assert TimeFrame.H4 in SUPPORTED_TIMEFRAMES
+
+
+def test_ohlcv_request_valid_futures() -> None:
+    """Ensure OHLCVRequest accepts linear perpetual futures symbols."""
+    req = OHLCVRequest(symbol="BTC/USDT:USDT", timeframe=TimeFrame.H1)
+    assert req.symbol == "BTC/USDT:USDT"
+    assert req.timeframe == TimeFrame.H1
 
 
 def test_ohlcv_request_valid() -> None:
