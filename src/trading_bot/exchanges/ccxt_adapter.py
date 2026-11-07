@@ -2,6 +2,17 @@
 
 Strictly blocks private credentials, order placement, account queries, and withdrawals.
 Converts exchange responses directly to validated domain models using Python Decimal.
+
+Precision and Limitations:
+- The underlying CCXT client is configured with `client.number = Decimal`.
+- For exchanges such as Binance where financial values (OHLCV prices/volumes, filters,
+  and funding rates) are serialized as JSON string tokens, CCXT parses them directly into
+  exact `Decimal` instances via `Decimal(str)` without any intermediate IEEE 754 binary float conversion.
+- Binary floats are strictly rejected across all financial data paths via `_to_decimal()`.
+- Limitation note: If an exchange endpoint returns unquoted JSON numeric literals, Python's
+  underlying standard JSON parser converts them to binary float prior to CCXT processing unless
+  a custom JSON decoder hook (`parse_float=Decimal`) is attached to the HTTP session. For Binance
+  public endpoints, all numeric values are string-quoted in raw wire payloads, guaranteeing exact precision.
 """
 
 from datetime import UTC, datetime
@@ -45,13 +56,37 @@ logger = structlog.get_logger()
 
 
 def _to_decimal(val: object) -> Decimal:
-    """Convert an arbitrary numeric value to Decimal safely via string conversion."""
+    """Convert a numeric value to Decimal safely without intermediate binary float conversion.
+
+    Rejects binary floats to enforce financial safety and exact precision.
+    """
     if val is None:
         raise ExchangeDataError("Received None where numeric value was expected")
+    if isinstance(val, float):
+        raise ExchangeDataError(
+            f"Binary float {val!r} detected in financial data path; exact Decimal required"
+        )
+    if isinstance(val, Decimal):
+        return val
     try:
         return Decimal(str(val))
     except Exception as e:
         raise ExchangeDataError(f"Failed to convert {val!r} to Decimal: {e}") from e
+
+
+def _decimal_places_from_step(step: Decimal) -> int:
+    """Calculate the number of decimal places from a tick or step size.
+
+    Normalizes the Decimal to eliminate trailing zeroes while preserving exact fractional scale.
+    Example: Decimal('0.01') -> 2, Decimal('0.00001') -> 5, Decimal('1') -> 0.
+    """
+    if step <= Decimal("0"):
+        raise ExchangeDataError(f"Tick or step size must be strictly positive, got: {step}")
+    normalized = step.normalize()
+    exp = normalized.as_tuple().exponent
+    if isinstance(exp, int) and exp < 0:
+        return abs(exp)
+    return 0
 
 
 class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
@@ -84,6 +119,11 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
                     self._client.set_sandbox_mode(True)
                 except Exception as e:
                     logger.warning("failed_to_set_sandbox_mode", error=str(e))
+
+        # Enforce exact Decimal parsing across CCXT internal parsers.
+        # CCXT uses self.number (default float) when parsing wire strings in safe_number().
+        # Setting self.number = Decimal instructs CCXT to convert wire strings directly to Decimal.
+        self._client.number = Decimal
 
     @property
     def exchange_id(self) -> str:
@@ -162,7 +202,13 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
             if not isinstance(row, (list, tuple)) or len(row) < 6:
                 raise ExchangeDataError(f"Malformed OHLCV row received at index {i}: {row}")
 
-            ts_ms = int(row[0])
+            if row[0] is None:
+                raise ExchangeDataError(f"Missing timestamp in OHLCV row at index {i}")
+            try:
+                ts_ms = int(row[0])
+            except Exception as e:
+                raise ExchangeDataError(f"Invalid timestamp {row[0]!r} at index {i}: {e}") from e
+
             open_val = _to_decimal(row[1])
             high_val = _to_decimal(row[2])
             low_val = _to_decimal(row[3])
@@ -209,7 +255,11 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
             raise ExchangeDataError(f"Failed to assemble valid CandleBatch: {e}") from e
 
     async def get_market_metadata(self, symbol: str) -> MarketMetadata:
-        """Fetch normalized symbols, precisions, and lot boundaries using public endpoint."""
+        """Fetch normalized symbols, precisions, and lot boundaries using public endpoint.
+
+        Dynamically handles both CCXT TICK_SIZE mode (where precision defines tick and step sizes)
+        and DECIMAL_PLACES mode (where precision defines integer counts of decimal places).
+        """
         self._ensure_open()
         if symbol not in SUPPORTED_SYMBOLS:
             raise ExchangeDataError(f"Unsupported symbol: '{symbol}'")
@@ -226,12 +276,42 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
         base_asset = market_info.get("base", symbol.split("/")[0])
         quote_asset = market_info.get("quote", "USDT")
         precision = market_info.get("precision", {})
-        price_prec = int(precision.get("price", 2))
-        qty_prec = int(precision.get("amount", 4))
-
         limits = market_info.get("limits", {})
-        cost_min = _to_decimal(limits.get("cost", {}).get("min", "5.0"))
-        amount_min = _to_decimal(limits.get("amount", {}).get("min", "0.0001"))
+
+        precision_mode = getattr(self._client, "precisionMode", ccxt.DECIMAL_PLACES)
+        if not isinstance(precision_mode, int):
+            precision_mode = ccxt.DECIMAL_PLACES
+
+        if precision_mode == ccxt.TICK_SIZE:
+            price_tick_raw = precision.get("price")
+            amount_step_raw = precision.get("amount")
+            if price_tick_raw is None or amount_step_raw is None:
+                raise ExchangeDataError(
+                    f"Market metadata for {symbol} missing price or amount tick_size under TICK_SIZE mode"
+                )
+            tick_size = _to_decimal(price_tick_raw)
+            step_size = _to_decimal(amount_step_raw)
+            price_prec = _decimal_places_from_step(tick_size)
+            qty_prec = _decimal_places_from_step(step_size)
+        else:
+            price_prec = int(precision.get("price", 2))
+            qty_prec = int(precision.get("amount", 4))
+            tick_size = Decimal("10") ** -price_prec
+            step_size = Decimal("10") ** -qty_prec
+
+        cost_limits = limits.get("cost") if isinstance(limits.get("cost"), dict) else {}
+        amount_limits = limits.get("amount") if isinstance(limits.get("amount"), dict) else {}
+
+        cost_min_val = cost_limits.get("min")
+        cost_min = _to_decimal(cost_min_val) if cost_min_val is not None else Decimal("5.0")
+
+        amount_min_val = amount_limits.get("min")
+        amount_min = _to_decimal(amount_min_val) if amount_min_val is not None else step_size
+
+        contract_size_val = market_info.get("contractSize")
+        contract_size = (
+            _to_decimal(contract_size_val) if contract_size_val is not None else Decimal("1.0")
+        )
 
         return MarketMetadata(
             symbol=symbol,
@@ -242,23 +322,29 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
             quantity_precision=qty_prec,
             min_notional=cost_min,
             min_quantity=amount_min,
-            step_size=amount_min,
-            tick_size=_to_decimal("0.01"),
-            contract_size=_to_decimal("1.0"),
+            step_size=step_size,
+            tick_size=tick_size,
+            contract_size=contract_size,
         )
 
     async def get_exchange_capabilities(self) -> ExchangeCapabilities:
-        """Query supported exchange features and order types."""
+        """Query supported exchange features and order types.
+
+        In this read-only adapter, all trading and margin execution capabilities
+        are strictly UNSUPPORTED to reflect operational reality and safety guarantees.
+        Only genuinely available public data feeds (OHLCV retrieval and funding history)
+        are marked SUPPORTED.
+        """
         self._ensure_open()
         return ExchangeCapabilities(
-            spot=CapabilityStatus.SUPPORTED,
-            linear_futures=CapabilityStatus.SUPPORTED,
-            isolated_margin=CapabilityStatus.SUPPORTED,
+            spot=CapabilityStatus.UNSUPPORTED,
+            linear_futures=CapabilityStatus.UNSUPPORTED,
+            isolated_margin=CapabilityStatus.UNSUPPORTED,
             cross_margin=CapabilityStatus.UNSUPPORTED,
-            client_order_id=CapabilityStatus.SUPPORTED,
-            reduce_only=CapabilityStatus.SUPPORTED,
-            stop_market=CapabilityStatus.SUPPORTED,
-            take_profit_market=CapabilityStatus.SUPPORTED,
+            client_order_id=CapabilityStatus.UNSUPPORTED,
+            reduce_only=CapabilityStatus.UNSUPPORTED,
+            stop_market=CapabilityStatus.UNSUPPORTED,
+            take_profit_market=CapabilityStatus.UNSUPPORTED,
             funding_history=CapabilityStatus.SUPPORTED,
             ohlcv_fetch=CapabilityStatus.SUPPORTED,
         )
@@ -276,6 +362,8 @@ class ReadOnlyCCXTAdapter(ExchangeAdapter, MarketDataFeed):
                 if res and "fundingRate" in res and res["fundingRate"] is not None:
                     funding_rate = _to_decimal(res["fundingRate"])
             return funding_rate
+        except (ExchangeDataError, ExchangeAdapterError):
+            raise
         except Exception as e:
             raise ExchangeAdapterError(f"Failed to fetch funding rate for {symbol}: {e}") from e
 

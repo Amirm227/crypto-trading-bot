@@ -8,7 +8,11 @@ import ccxt
 import pytest
 
 from trading_bot.domain.types import TimeFrame
-from trading_bot.exchanges.ccxt_adapter import ReadOnlyCCXTAdapter
+from trading_bot.exchanges.ccxt_adapter import (
+    ReadOnlyCCXTAdapter,
+    _decimal_places_from_step,
+    _to_decimal,
+)
 from trading_bot.exchanges.contracts import (
     CapabilityStatus,
     ExchangeAdapter,
@@ -32,8 +36,10 @@ from trading_bot.market_data.contracts import (
 
 @pytest.fixture
 def mock_client() -> AsyncMock:
-    """Fixture providing a mocked CCXT async exchange client."""
+    """Fixture providing a mocked CCXT async exchange client configured with Decimal parser."""
     client = AsyncMock()
+    client.precisionMode = ccxt.DECIMAL_PLACES
+    client.number = Decimal
     # Mock server time: 2026-11-07 12:00:00 UTC
     client.fetch_time.return_value = 1794052800000
     # Mock markets
@@ -43,10 +49,10 @@ def mock_client() -> AsyncMock:
             "base": "BTC",
             "quote": "USDT",
             "precision": {"price": 2, "amount": 5},
-            "limits": {"cost": {"min": 5.0}, "amount": {"min": 0.00001}},
+            "limits": {"cost": {"min": Decimal("5.0")}, "amount": {"min": Decimal("0.00001")}},
         }
     }
-    client.fetch_funding_rate.return_value = {"fundingRate": 0.0001}
+    client.fetch_funding_rate.return_value = {"fundingRate": Decimal("0.0001")}
     return client
 
 
@@ -79,9 +85,9 @@ async def test_fetch_ohlcv_normalizes_to_decimal_candle_batch(mock_client: Async
     ts3 = int(datetime(2026, 11, 7, 12, 0, tzinfo=UTC).timestamp() * 1000)
 
     mock_client.fetch_ohlcv.return_value = [
-        [ts1, 69500.25, 70100.50, 69200.00, 69800.75, 120.45],
-        [ts2, 69800.75, 70500.00, 69700.00, 70200.00, 150.10],
-        [ts3, 70200.00, 70600.00, 70100.00, 70400.00, 45.20],
+        [ts1, Decimal("69500.25"), Decimal("70100.50"), Decimal("69200.00"), Decimal("69800.75"), Decimal("120.45")],
+        [ts2, Decimal("69800.75"), Decimal("70500.00"), Decimal("69700.00"), Decimal("70200.00"), Decimal("150.10")],
+        [ts3, Decimal("70200.00"), Decimal("70600.00"), Decimal("70100.00"), Decimal("70400.00"), Decimal("45.20")],
     ]
 
     adapter = ReadOnlyCCXTAdapter(client=mock_client)
@@ -96,6 +102,10 @@ async def test_fetch_ohlcv_normalizes_to_decimal_candle_batch(mock_client: Async
     c1 = batch.candles[0]
     assert c1.open == Decimal("69500.25")
     assert isinstance(c1.open, Decimal)
+    assert isinstance(c1.high, Decimal)
+    assert isinstance(c1.low, Decimal)
+    assert isinstance(c1.close, Decimal)
+    assert isinstance(c1.volume, Decimal)
     assert c1.is_closed is True
 
     c3 = batch.candles[2]
@@ -114,17 +124,29 @@ async def test_get_market_metadata_normalized(mock_client: AsyncMock) -> None:
     assert meta.quantity_precision == 5
     assert meta.min_notional == Decimal("5.0")
     assert isinstance(meta.min_notional, Decimal)
+    assert meta.min_quantity == Decimal("0.00001")
+    assert isinstance(meta.min_quantity, Decimal)
+    assert meta.step_size == Decimal("0.00001")
+    assert meta.tick_size == Decimal("0.01")
 
 
 @pytest.mark.asyncio
 async def test_get_exchange_capabilities(mock_client: AsyncMock) -> None:
-    """Ensure capabilities explicitly forbid cross margin and support isolated margin."""
+    """Ensure capabilities strictly mark all execution/margin operations as UNSUPPORTED for safety."""
     adapter = ReadOnlyCCXTAdapter(client=mock_client)
     caps = await adapter.get_exchange_capabilities()
 
     assert isinstance(caps, ExchangeCapabilities)
-    assert caps.isolated_margin == CapabilityStatus.SUPPORTED
+    assert caps.spot == CapabilityStatus.UNSUPPORTED
+    assert caps.linear_futures == CapabilityStatus.UNSUPPORTED
+    assert caps.isolated_margin == CapabilityStatus.UNSUPPORTED
     assert caps.cross_margin == CapabilityStatus.UNSUPPORTED
+    assert caps.client_order_id == CapabilityStatus.UNSUPPORTED
+    assert caps.reduce_only == CapabilityStatus.UNSUPPORTED
+    assert caps.stop_market == CapabilityStatus.UNSUPPORTED
+    assert caps.take_profit_market == CapabilityStatus.UNSUPPORTED
+    assert caps.funding_history == CapabilityStatus.SUPPORTED
+    assert caps.ohlcv_fetch == CapabilityStatus.SUPPORTED
 
 
 @pytest.mark.asyncio
@@ -165,7 +187,7 @@ async def test_network_and_rate_limit_error_handling(mock_client: AsyncMock) -> 
     assert "empty candle list" in str(exc_empty.value)
 
     # Malformed row returned
-    mock_client.fetch_ohlcv.return_value = [[123456789, 70000]]  # only 2 elements instead of 6
+    mock_client.fetch_ohlcv.return_value = [[123456789, Decimal("70000")]]  # only 2 elements instead of 6
     with pytest.raises(ExchangeDataError) as exc_malformed:
         await adapter.fetch_ohlcv(req)
     assert "Malformed OHLCV row" in str(exc_malformed.value)
@@ -298,14 +320,211 @@ async def test_get_funding_rate_error_handling(mock_client: AsyncMock) -> None:
         await adapter.get_funding_rate("BTC/USDT")
 
 
-def test_to_decimal_error_handling() -> None:
-    """Ensure _to_decimal handles None and invalid formats."""
-    from trading_bot.exchanges.ccxt_adapter import _to_decimal
-
-    with pytest.raises(ExchangeDataError) as exc1:
+def test_to_decimal_handling_and_float_rejection() -> None:
+    """Ensure _to_decimal converts safe types and strictly rejects binary floats."""
+    # None raises
+    with pytest.raises(ExchangeDataError) as exc_none:
         _to_decimal(None)
-    assert "Received None" in str(exc1.value)
+    assert "Received None" in str(exc_none.value)
 
-    with pytest.raises(ExchangeDataError) as exc2:
+    # Binary float raises
+    with pytest.raises(ExchangeDataError) as exc_float:
+        _to_decimal(69500.25)
+    assert "Binary float" in str(exc_float.value)
+
+    # Invalid string raises
+    with pytest.raises(ExchangeDataError) as exc_str:
         _to_decimal("not_a_valid_decimal")
-    assert "Failed to convert" in str(exc2.value)
+    assert "Failed to convert" in str(exc_str.value)
+
+    # Valid Decimal returns exact instance
+    dec_val = Decimal("69500.123456789")
+    assert _to_decimal(dec_val) is dec_val
+
+    # Valid string converted to Decimal
+    assert _to_decimal("69500.25") == Decimal("69500.25")
+
+    # Valid int converted to Decimal
+    assert _to_decimal(100) == Decimal("100")
+
+
+def test_decimal_places_from_step() -> None:
+    """Ensure _decimal_places_from_step derives exact precision and rejects non-positive values."""
+    assert _decimal_places_from_step(Decimal("0.01")) == 2
+    assert _decimal_places_from_step(Decimal("0.00001")) == 5
+    assert _decimal_places_from_step(Decimal("0.00000001")) == 8
+    assert _decimal_places_from_step(Decimal("1")) == 0
+    assert _decimal_places_from_step(Decimal("1.0")) == 0
+    assert _decimal_places_from_step(Decimal("100")) == 0
+    assert _decimal_places_from_step(Decimal("0.05")) == 2
+    assert _decimal_places_from_step(Decimal("0.25")) == 2
+    assert _decimal_places_from_step(Decimal("0.00100")) == 3
+
+    # Non-positive values raise ExchangeDataError
+    with pytest.raises(ExchangeDataError):
+        _decimal_places_from_step(Decimal("0"))
+
+    with pytest.raises(ExchangeDataError):
+        _decimal_places_from_step(Decimal("-0.01"))
+
+
+@pytest.mark.asyncio
+async def test_client_number_configured_to_decimal(mock_client: AsyncMock) -> None:
+    """Verify underlying CCXT client is configured with number=Decimal upon adapter initialization."""
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    assert mock_client.number == Decimal
+    assert adapter._client.number == Decimal
+
+    # Test fresh client instantiation sets number = Decimal
+    fresh_adapter = ReadOnlyCCXTAdapter(exchange_id="binance")
+    assert fresh_adapter._client.number == Decimal
+    await fresh_adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_high_precision_ohlcv_preserved_without_float_degradation(mock_client: AsyncMock) -> None:
+    """Ensure high-precision OHLCV values (e.g. 18 decimal places) are preserved exactly without float truncation."""
+    ts = int(datetime(2026, 11, 7, 10, 0, tzinfo=UTC).timestamp() * 1000)
+    p_open = Decimal("69500.123456789012345678")
+    p_high = Decimal("70100.987654321098765432")
+    p_low = Decimal("69200.000000000000000001")
+    p_close = Decimal("69800.555555555555555555")
+    p_vol = Decimal("120.123456789012345678")
+
+    mock_client.fetch_ohlcv.return_value = [[ts, p_open, p_high, p_low, p_close, p_vol]]
+
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    req = OHLCVRequest(symbol="BTC/USDT", timeframe=TimeFrame.H1)
+    batch = await adapter.fetch_ohlcv(req)
+
+    candle = batch.candles[0]
+    assert candle.open == p_open
+    assert str(candle.open) == "69500.123456789012345678"
+    assert candle.high == p_high
+    assert str(candle.high) == "70100.987654321098765432"
+    assert candle.low == p_low
+    assert str(candle.low) == "69200.000000000000000001"
+    assert candle.close == p_close
+    assert str(candle.close) == "69800.555555555555555555"
+    assert candle.volume == p_vol
+    assert str(candle.volume) == "120.123456789012345678"
+
+
+@pytest.mark.asyncio
+async def test_fetch_ohlcv_rejects_binary_float(mock_client: AsyncMock) -> None:
+    """Ensure receiving binary float values in raw OHLCV rows triggers ExchangeDataError."""
+    ts = int(datetime(2026, 11, 7, 10, 0, tzinfo=UTC).timestamp() * 1000)
+    mock_client.fetch_ohlcv.return_value = [[ts, 69500.25, 70100.50, 69200.00, 69800.75, 120.45]]
+
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    req = OHLCVRequest(symbol="BTC/USDT", timeframe=TimeFrame.H1)
+
+    with pytest.raises(ExchangeDataError) as exc:
+        await adapter.fetch_ohlcv(req)
+    assert "Binary float" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_ohlcv_invalid_or_missing_timestamp(mock_client: AsyncMock) -> None:
+    """Ensure fetch_ohlcv validates raw timestamp before processing."""
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    req = OHLCVRequest(symbol="BTC/USDT", timeframe=TimeFrame.H1)
+
+    # Missing None timestamp
+    mock_client.fetch_ohlcv.return_value = [
+        [None, Decimal("69000"), Decimal("69100"), Decimal("68900"), Decimal("69050"), Decimal("10")]
+    ]
+    with pytest.raises(ExchangeDataError) as exc_none:
+        await adapter.fetch_ohlcv(req)
+    assert "Missing timestamp" in str(exc_none.value)
+
+    # Invalid timestamp
+    mock_client.fetch_ohlcv.return_value = [
+        ["invalid_ts", Decimal("69000"), Decimal("69100"), Decimal("68900"), Decimal("69050"), Decimal("10")]
+    ]
+    with pytest.raises(ExchangeDataError) as exc_inv:
+        await adapter.fetch_ohlcv(req)
+    assert "Invalid timestamp" in str(exc_inv.value)
+
+
+@pytest.mark.asyncio
+async def test_get_market_metadata_tick_size_mode(mock_client: AsyncMock) -> None:
+    """Ensure get_market_metadata correctly parses TICK_SIZE mode and separates min_qty from step_size."""
+    mock_client.precisionMode = ccxt.TICK_SIZE
+    mock_client.load_markets.return_value = {
+        "BTC/USDT": {
+            "symbol": "BTC/USDT",
+            "base": "BTC",
+            "quote": "USDT",
+            "precision": {
+                "price": Decimal("0.01"),
+                "amount": Decimal("0.00001"),
+            },
+            "limits": {
+                "cost": {"min": Decimal("10.0")},
+                "amount": {"min": Decimal("0.001")},
+            },
+        }
+    }
+
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    meta = await adapter.get_market_metadata("BTC/USDT")
+
+    assert meta.price_precision == 2
+    assert meta.quantity_precision == 5
+    assert meta.tick_size == Decimal("0.01")
+    assert meta.step_size == Decimal("0.00001")
+    # min_quantity separated from step_size
+    assert meta.min_quantity == Decimal("0.001")
+    assert meta.min_notional == Decimal("10.0")
+
+
+@pytest.mark.asyncio
+async def test_get_market_metadata_tick_size_high_precision(mock_client: AsyncMock) -> None:
+    """Ensure get_market_metadata correctly calculates high precision in TICK_SIZE mode."""
+    mock_client.precisionMode = ccxt.TICK_SIZE
+    mock_client.load_markets.return_value = {
+        "SOL/USDT": {
+            "symbol": "SOL/USDT",
+            "base": "SOL",
+            "quote": "USDT",
+            "precision": {
+                "price": Decimal("0.00001"),
+                "amount": Decimal("0.00000001"),
+            },
+            "limits": {
+                "cost": {"min": Decimal("5.0")},
+                "amount": {"min": Decimal("0.00000001")},
+            },
+        }
+    }
+
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    meta = await adapter.get_market_metadata("SOL/USDT")
+
+    assert meta.price_precision == 5
+    assert meta.quantity_precision == 8
+    assert meta.tick_size == Decimal("0.00001")
+    assert meta.step_size == Decimal("0.00000001")
+
+
+@pytest.mark.asyncio
+async def test_get_market_metadata_tick_size_missing_precision_raises(mock_client: AsyncMock) -> None:
+    """Ensure missing price or amount in TICK_SIZE mode raises ExchangeDataError."""
+    mock_client.precisionMode = ccxt.TICK_SIZE
+    mock_client.load_markets.return_value = {
+        "BTC/USDT": {
+            "symbol": "BTC/USDT",
+            "base": "BTC",
+            "quote": "USDT",
+            "precision": {
+                "price": None,
+                "amount": Decimal("0.00001"),
+            },
+        }
+    }
+
+    adapter = ReadOnlyCCXTAdapter(client=mock_client)
+    with pytest.raises(ExchangeDataError) as exc:
+        await adapter.get_market_metadata("BTC/USDT")
+    assert "missing price or amount tick_size" in str(exc.value)
