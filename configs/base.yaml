@@ -1,0 +1,27 @@
+app_name: "crypto-trading-bot"
+version: "0.1.0"
+environment: "paper"
+log_level: "INFO"
+
+exchange:
+  exchange_id: "binance"
+  sandbox: true
+  timeout_ms: 10000
+  rate_limit_enabled: true
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "trading_bot"
+  user: "postgres"
+  ssl_mode: "prefer"
+
+monitoring:
+  heartbeat_interval_seconds: 30
+  metrics_enabled: true
+  metrics_port: 8000
+
+safety:
+  enable_live_trading: false
+  allow_withdrawals: false
+  fail_closed_on_error: true

@@ -1,0 +1,11 @@
+enabled: true
+strategy_id: mean_reversion
+version: "1.0.0"
+adx_max: 20.0
+bb_period: 20
+bb_stddev: 2.0
+rsi_period: 14
+long_rsi_max: 30.0
+short_rsi_min: 70.0
+exit_target: middle_band
+min_risk_reward: 2.0

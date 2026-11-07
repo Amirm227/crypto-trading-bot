@@ -1,0 +1,28 @@
+profile: conservative_paper
+
+risk:
+  per_trade_pct: 0.25
+  max_open_risk_pct: 0.50
+  daily_loss_limit_pct: 0.75
+  weekly_loss_limit_pct: 2.00
+  max_drawdown_pct: 8.00
+  min_risk_reward: 2.0
+  max_new_trades_per_day: 3
+
+futures:
+  enabled_in_paper: true
+  enabled_live: false
+  leverage: 1
+  margin_mode: isolated
+  allow_cross_margin: false
+
+execution:
+  require_protective_stop: true
+  entry_halt_on_unknown_order: true
+  forced_trading: false
+  martingale: false
+
+safety:
+  enable_live_trading: false
+  allow_withdrawals: false
+  fail_closed_on_error: true

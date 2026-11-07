@@ -1,0 +1,33 @@
+symbols:
+  - id: BTC
+    exchange_symbol: "BTC/USDT"
+    enabled: true
+    min_notional: 5.0
+    price_precision: 2
+    quantity_precision: 5
+    step_size: 0.00001
+
+  - id: ETH
+    exchange_symbol: "ETH/USDT"
+    enabled: true
+    min_notional: 5.0
+    price_precision: 2
+    quantity_precision: 4
+    step_size: 0.0001
+
+  - id: SOL
+    exchange_symbol: "SOL/USDT"
+    enabled: true
+    min_notional: 5.0
+    price_precision: 2
+    quantity_precision: 2
+    step_size: 0.01
+
+timeframes:
+  regime: 4h
+  entry: 1h
+
+markets:
+  spot: true
+  futures_paper: true
+  futures_live: false
