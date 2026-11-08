@@ -63,7 +63,7 @@ class DatabaseConfig(DomainModel):
     port: int = Field(default=5432, ge=1, le=65535)
     name: str = "trading_bot"
     user: str = "postgres"
-    password: str = "placeholder_db_password"
+    password: str | None = None
     ssl_mode: str = "prefer"
 
     @model_validator(mode="after")
@@ -74,10 +74,33 @@ class DatabaseConfig(DomainModel):
             raise ValueError("database user must not be empty")
         return self
 
-    def get_url(self, password: str | None = None) -> str:
-        """Construct PostgreSQL asyncpg connection URL."""
+    def get_url(self, password: str | None = None, hide_password: bool = False) -> str:
+        """Construct PostgreSQL asyncpg connection URL safely using SQLAlchemy URL.create."""
         pwd = password if password is not None else self.password
-        return f"postgresql+asyncpg://{self.user}:{pwd}@{self.host}:{self.port}/{self.name}"
+        if pwd is None or not str(pwd).strip():
+            raise ValueError(
+                "Database password is required to construct PostgreSQL connection URL. "
+                "Provide password explicitly or set DB_PASSWORD in environment."
+            )
+        from sqlalchemy.engine import URL
+
+        url = URL.create(
+            drivername="postgresql+asyncpg",
+            username=self.user,
+            password=pwd,
+            host=self.host,
+            port=self.port,
+            database=self.name,
+        )
+        return url.render_as_string(hide_password=hide_password)
+
+    def __repr__(self) -> str:
+        pwd_repr = "***" if self.password else None
+        return (
+            f"DatabaseConfig(host={self.host!r}, port={self.port}, "
+            f"name={self.name!r}, user={self.user!r}, password={pwd_repr!r}, "
+            f"ssl_mode={self.ssl_mode!r})"
+        )
 
 
 class MonitoringConfig(DomainModel):
@@ -108,7 +131,9 @@ class SafetyConfig(DomainModel):
                 "The bot must never have withdrawal permissions."
             )
         if not self.fail_closed_on_error:
-            raise ValueError("fail_closed_on_error must be True. Fail-open operation is prohibited.")
+            raise ValueError(
+                "fail_closed_on_error must be True. Fail-open operation is prohibited."
+            )
         return self
 
 
@@ -130,13 +155,19 @@ class RiskLimitsConfig(DomainModel):
             raise ValueError(f"per_trade_pct must be in (0, 0.25], got {self.per_trade_pct}")
 
         if self.max_open_risk_pct <= zero or self.max_open_risk_pct > Decimal("0.50"):
-            raise ValueError(f"max_open_risk_pct must be in (0, 0.50], got {self.max_open_risk_pct}")
+            raise ValueError(
+                f"max_open_risk_pct must be in (0, 0.50], got {self.max_open_risk_pct}"
+            )
 
         if self.daily_loss_limit_pct <= zero or self.daily_loss_limit_pct > Decimal("0.75"):
-            raise ValueError(f"daily_loss_limit_pct must be in (0, 0.75], got {self.daily_loss_limit_pct}")
+            raise ValueError(
+                f"daily_loss_limit_pct must be in (0, 0.75], got {self.daily_loss_limit_pct}"
+            )
 
         if self.weekly_loss_limit_pct <= zero or self.weekly_loss_limit_pct > Decimal("2.00"):
-            raise ValueError(f"weekly_loss_limit_pct must be in (0, 2.00], got {self.weekly_loss_limit_pct}")
+            raise ValueError(
+                f"weekly_loss_limit_pct must be in (0, 2.00], got {self.weekly_loss_limit_pct}"
+            )
 
         if self.max_drawdown_pct <= zero or self.max_drawdown_pct > Decimal("8.00"):
             raise ValueError(f"max_drawdown_pct must be in (0, 8.00], got {self.max_drawdown_pct}")
@@ -176,7 +207,9 @@ class FuturesConfig(DomainModel):
         if self.margin_mode.lower() != "isolated":
             raise ValueError(f"Margin mode must be 'isolated', got {self.margin_mode!r}.")
         if self.allow_cross_margin:
-            raise ValueError("allow_cross_margin must be False. Cross margin is strictly prohibited.")
+            raise ValueError(
+                "allow_cross_margin must be False. Cross margin is strictly prohibited."
+            )
         return self
 
 
@@ -405,7 +438,7 @@ class EnvSettings(BaseSettings):
     db_port: int = 5432
     db_name: str = "trading_bot"
     db_user: str = "postgres"
-    db_password: str = "placeholder_db_password"
+    db_password: str | None = None
     database_url: str | None = None
     exchange_id: str = "binance"
     exchange_sandbox: bool = True
@@ -433,6 +466,22 @@ class EnvSettings(BaseSettings):
         if self.allow_cross_margin:
             raise ValueError("ALLOW_CROSS_MARGIN must be false.")
         return self
+
+    def __repr__(self) -> str:
+        masked_pwd = "***" if self.db_password else None
+        masked_url = None
+        if self.database_url:
+            try:
+                from sqlalchemy.engine import make_url
+
+                masked_url = make_url(self.database_url).render_as_string(hide_password=True)
+            except Exception:
+                masked_url = "***"
+        return (
+            f"EnvSettings(app_env={self.app_env!r}, log_level={self.log_level!r}, "
+            f"db_host={self.db_host!r}, db_port={self.db_port}, db_name={self.db_name!r}, "
+            f"db_user={self.db_user!r}, db_password={masked_pwd!r}, database_url={masked_url!r})"
+        )
 
 
 class AppConfig(DomainModel):

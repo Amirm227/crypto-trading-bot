@@ -18,3 +18,11 @@ class CandleRepositoryError(PersistenceError):
 
 class ConflictingCandleError(CandleRepositoryError):
     """Raised when attempting to persist a candle that conflicts with existing historical data."""
+
+
+class BatchHomogeneityError(CandleRepositoryError, ValueError):
+    """Raised when a batch contains mixed exchanges, symbols, market types, or timeframes."""
+
+
+class UnsafeDatabaseTargetError(DatabaseConnectionError, ValueError):
+    """Raised when an integration test attempts to execute against an unsafe or ambiguous database."""

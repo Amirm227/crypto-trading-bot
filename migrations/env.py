@@ -20,8 +20,11 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    """Retrieve database connection URL from environment or alembic.ini."""
-    return os.environ.get("DATABASE_URL") or config.get_main_option("sqlalchemy.url", "")
+    """Retrieve database connection URL from Alembic config or environment."""
+    main_opt = config.get_main_option("sqlalchemy.url", "")
+    if main_opt and not main_opt.endswith("placeholder_db_password@localhost:5432/trading_bot"):
+        return main_opt
+    return os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL") or main_opt
 
 
 def run_migrations_offline() -> None:
@@ -66,8 +69,19 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
-    """Entrypoint for online migrations."""
-    asyncio.run(run_async_migrations())
+    """Entrypoint for online migrations supporting running event loops."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(asyncio.run, run_async_migrations()).result()
+    else:
+        asyncio.run(run_async_migrations())
 
 
 if context.is_offline_mode():

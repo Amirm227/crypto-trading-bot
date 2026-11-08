@@ -1,11 +1,9 @@
 """Unit tests for DatabaseManager lifecycle, session transactions, and URL construction."""
 
-from pathlib import Path
-
 import pytest
 from sqlalchemy import text
 
-from trading_bot.domain.config import DatabaseConfig, load_app_config
+from trading_bot.domain.config import DatabaseConfig, EnvSettings, load_app_config
 from trading_bot.persistence.database import DatabaseManager, create_database_manager
 
 
@@ -81,9 +79,101 @@ def test_database_config_url_construction() -> None:
     )
 
 
-def test_create_database_manager_from_app_config(tmp_path: Path) -> None:
-    """Ensure create_database_manager constructs manager from AppConfig."""
+def test_missing_password_fails_clearly() -> None:
+    """Ensure missing credentials fail fast when configuring a PostgreSQL connection."""
+    cfg = DatabaseConfig(
+        host="localhost",
+        port=5432,
+        name="trading_bot",
+        user="postgres",
+        password=None,
+    )
+    with pytest.raises(ValueError) as exc:
+        cfg.get_url()
+    assert "Database password is required" in str(exc.value)
+
     app_cfg = load_app_config(config_dir="configs")
+    with pytest.raises(ValueError) as exc2:
+        create_database_manager(app_cfg)
+    assert "Database password is required" in str(exc2.value)
+
+
+def test_special_characters_in_credentials() -> None:
+    """Ensure special characters in usernames and passwords are safely escaped via URL.create."""
+    cfg = DatabaseConfig(
+        host="localhost",
+        port=5432,
+        name="trading_bot",
+        user="bot_user@company",
+        password="p@ss:w/ord#1?&=",
+    )
+    url = cfg.get_url()
+    assert "bot_user%40company" in url
+    assert "p%40ss%3Aw%2Ford%231%3F%26%3D" in url
+    # Password should NOT appear unescaped with delimiter confusion
+    assert "@company:p@ss" not in url
+
+
+def test_url_precedence_in_create_database_manager() -> None:
+    """Ensure deterministic precedence: DATABASE_URL > DB_* env vars > base.yaml."""
+    app_cfg = load_app_config(config_dir="configs")
+
+    # 1. When database_url is provided in env_settings, it takes top precedence
+    app_cfg.env_settings.database_url = (
+        "postgresql+asyncpg://env_user:env_pass@remote_host:5439/env_db"
+    )
+    app_cfg.env_settings.db_host = "ignored_host"
     db_mgr = create_database_manager(app_cfg)
+    assert db_mgr._url == "postgresql+asyncpg://env_user:env_pass@remote_host:5439/env_db"
+
+    # 2. When database_url is None, DB_* overrides take precedence over base.yaml
+    app_cfg.env_settings.database_url = None
+    app_cfg.env_settings.db_host = "custom_env_host"
+    app_cfg.env_settings.db_port = 5433
+    app_cfg.env_settings.db_user = "custom_env_user"
+    app_cfg.env_settings.db_password = "env_secret_password"
+    app_cfg.env_settings.db_name = "custom_env_db"
+
+    db_mgr2 = create_database_manager(app_cfg)
+    assert "custom_env_host:5433" in db_mgr2._url
+    assert "custom_env_user" in db_mgr2._url
+    assert "custom_env_db" in db_mgr2._url
+
+    # 3. Explicit password override passed to create_database_manager takes precedence
+    db_mgr3 = create_database_manager(app_cfg, password="override_pwd")
+    assert "override_pwd" in db_mgr3._url
+
+
+def test_password_never_exposed_in_repr_or_logs() -> None:
+    """Ensure passwords and credentials are never leaked in representations or logs."""
+    cfg = DatabaseConfig(
+        host="localhost",
+        port=5432,
+        name="trading_bot",
+        user="postgres",
+        password="super_secret_password",
+    )
+    cfg_repr = repr(cfg)
+    assert "super_secret_password" not in cfg_repr
+    assert "password='***'" in cfg_repr
+
+    env_settings = EnvSettings(
+        db_password="super_secret_env_password",
+        database_url="postgresql+asyncpg://user:secret@localhost:5432/db",
+    )
+    env_repr = repr(env_settings)
+    assert "super_secret_env_password" not in env_repr
+    assert "secret@" not in env_repr
+
+    # DatabaseManager masking
+    mgr = DatabaseManager("postgresql+asyncpg://user:my_secret@localhost:5432/trading_bot")
+    assert "my_secret" not in mgr.safe_url
+    assert "my_secret" not in repr(mgr)
+    assert "***" in mgr.safe_url
+
+
+def test_legitimate_test_database_without_password() -> None:
+    """Legitimate test configurations (such as SQLite) must connect without password."""
+    db_mgr = create_database_manager("sqlite+aiosqlite:///:memory:")
     assert isinstance(db_mgr, DatabaseManager)
-    assert "postgresql+asyncpg://" in db_mgr._url
+    assert db_mgr._url == "sqlite+aiosqlite:///:memory:"

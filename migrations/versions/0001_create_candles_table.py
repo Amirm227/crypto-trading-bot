@@ -19,10 +19,16 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Create candles table, composite unique constraint, and performance indexes."""
+    """Create candles table, composite unique constraint, and performance index."""
     op.create_table(
         "candles",
-        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True, nullable=False),
+        sa.Column(
+            "id",
+            sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+            primary_key=True,
+            autoincrement=True,
+            nullable=False,
+        ),
         sa.Column("exchange", sa.String(length=32), nullable=False),
         sa.Column("symbol", sa.String(length=32), nullable=False),
         sa.Column("market_type", sa.String(length=16), nullable=False),
@@ -46,12 +52,6 @@ def upgrade() -> None:
         ),
     )
     op.create_index(
-        "ix_candles_query",
-        "candles",
-        ["exchange", "symbol", "market_type", "timeframe", "open_time"],
-        unique=False,
-    )
-    op.create_index(
         "ix_candles_latest",
         "candles",
         ["exchange", "symbol", "market_type", "timeframe", "is_closed", "open_time"],
@@ -61,7 +61,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Drop indexes, constraints, and candles table."""
-    op.drop_index("ix_candles_latest", table_name="candles")
-    op.drop_index("ix_candles_query", table_name="candles")
-    op.drop_constraint("uq_candles_series_open_time", "candles", type_="unique")
+    bind = op.get_bind()
+    if bind.dialect.name != "sqlite":
+        op.drop_index("ix_candles_latest", table_name="candles")
+        op.drop_constraint("uq_candles_series_open_time", "candles", type_="unique")
+    else:
+        op.drop_index("ix_candles_latest", table_name="candles")
     op.drop_table("candles")

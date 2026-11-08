@@ -1,5 +1,6 @@
 """Unit tests for PostgresCandleRepository operations, idempotency, and transaction safety."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -11,6 +12,7 @@ from trading_bot.domain.types import MarketType, TimeFrame
 from trading_bot.market_data.contracts import CandleBatch, OHLCVRequest
 from trading_bot.persistence.database import DatabaseManager
 from trading_bot.persistence.exceptions import (
+    BatchHomogeneityError,
     CandleRepositoryError,
     ConflictingCandleError,
 )
@@ -269,7 +271,9 @@ async def test_retrieval_filters_and_deterministic_ordering(repo: PostgresCandle
     other_sym = make_candle(symbol="ETH/USDT", open_time=t0)
     other_tf = make_candle(symbol="BTC/USDT", timeframe=TimeFrame.H4, open_time=t0)
 
-    await repo.save_batch((c3, c1, c2, other_sym, other_tf))
+    await repo.save_batch((c3, c1, c2))
+    await repo.save_candle(other_sym)
+    await repo.save_candle(other_tf)
 
     # Query with since/until filter
     req = OHLCVRequest(
@@ -346,3 +350,133 @@ async def test_repository_error_handling() -> None:
 
     with pytest.raises(CandleRepositoryError):
         await repo.save_candle(make_candle())
+
+
+@pytest.mark.asyncio
+async def test_save_batch_rejects_mixed_series(repo: PostgresCandleRepository) -> None:
+    """Ensure save_batch explicitly rejects batches containing mixed series with BatchHomogeneityError."""
+    t0 = datetime(2026, 11, 7, 0, 0, tzinfo=UTC)
+
+    # 1. Mixed symbols
+    c_btc = make_candle(symbol="BTC/USDT", open_time=t0)
+    c_eth = make_candle(symbol="ETH/USDT", open_time=t0 + timedelta(hours=1))
+    with pytest.raises(BatchHomogeneityError) as exc_sym:
+        await repo.save_batch((c_btc, c_eth))
+    assert "Batch homogeneity violation" in str(exc_sym.value)
+    assert "ETH/USDT" in str(exc_sym.value)
+
+    # 2. Mixed market types (Spot vs Futures)
+    c_spot = make_candle(market_type=MarketType.SPOT, open_time=t0)
+    c_futures = make_candle(market_type=MarketType.FUTURES, open_time=t0 + timedelta(hours=1))
+    with pytest.raises(BatchHomogeneityError) as exc_mkt:
+        await repo.save_batch((c_spot, c_futures))
+    assert "Batch homogeneity violation" in str(exc_mkt.value)
+
+    # 3. Mixed timeframes (1H vs 4H)
+    c_1h = make_candle(timeframe=TimeFrame.H1, open_time=t0)
+    c_4h = make_candle(timeframe=TimeFrame.H4, open_time=t0 + timedelta(hours=4))
+    with pytest.raises(BatchHomogeneityError) as exc_tf:
+        await repo.save_batch((c_1h, c_4h))
+    assert "Batch homogeneity violation" in str(exc_tf.value)
+
+    # 4. Mixed exchanges
+    c_binance = make_candle(open_time=t0)
+    c_coinbase = Candle(
+        exchange="coinbase",
+        symbol="BTC/USDT",
+        market_type=MarketType.SPOT,
+        timeframe=TimeFrame.H1,
+        open_time=t0 + timedelta(hours=1),
+        close_time=t0 + timedelta(hours=2),
+        open=Decimal("70000.00"),
+        high=Decimal("70500.00"),
+        low=Decimal("69800.00"),
+        close=Decimal("70200.00"),
+        volume=Decimal("100.00"),
+        is_closed=True,
+        ingested_at=t0 + timedelta(hours=2, seconds=1),
+    )
+    with pytest.raises(BatchHomogeneityError) as exc_ex:
+        await repo.save_batch((c_binance, c_coinbase))
+    assert "Batch homogeneity violation" in str(exc_ex.value)
+
+
+@pytest.mark.asyncio
+async def test_save_batch_intra_batch_identical_duplicates_deduplicated(
+    repo: PostgresCandleRepository,
+) -> None:
+    """Ensure identical duplicates within a batch are deduplicated deterministically and persisted."""
+    t0 = datetime(2026, 11, 7, 0, 0, tzinfo=UTC)
+    c1 = make_candle(open_time=t0)
+    c1_dup = make_candle(open_time=t0)  # Identical duplicate in the same batch
+    c2 = make_candle(open_time=t0 + timedelta(hours=1))
+
+    inserted = await repo.save_batch((c1, c1_dup, c2))
+    assert inserted == 2
+
+    stored = await repo.get_candles_by_range(symbol="BTC/USDT", timeframe=TimeFrame.H1)
+    assert len(stored) == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_duplicate_insertion(repo: PostgresCandleRepository) -> None:
+    """Ensure concurrent identical insertions are idempotent and do not fail with unhandled integrity error."""
+    t0 = datetime(2026, 11, 7, 10, 0, tzinfo=UTC)
+    c = make_candle(open_time=t0)
+
+    # Execute concurrent save operations simultaneously
+    results = await asyncio.gather(
+        repo.save_candle(c),
+        repo.save_candle(c),
+        repo.save_candle(c),
+        return_exceptions=True,
+    )
+
+    # All concurrent attempts must succeed without exception
+    for r in results:
+        assert r is None
+
+    stored = await repo.get_candles_by_range(symbol="BTC/USDT", timeframe=TimeFrame.H1)
+    assert len(stored) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_conflicting_insertion_rejected(repo: PostgresCandleRepository) -> None:
+    """Ensure concurrent conflicting writes safely reject the conflict without corrupting data."""
+    t0 = datetime(2026, 11, 7, 10, 0, tzinfo=UTC)
+    original = make_candle(open_time=t0, close_price=Decimal("70100.00"))
+    conflicting = make_candle(open_time=t0, close_price=Decimal("70300.00"))
+
+    # Execute concurrent save with conflicting payloads
+    results = await asyncio.gather(
+        repo.save_candle(original),
+        repo.save_candle(conflicting),
+        return_exceptions=True,
+    )
+
+    # Exactly one must succeed (None) and one must raise ConflictingCandleError
+    exceptions = [r for r in results if isinstance(r, Exception)]
+    successes = [r for r in results if r is None]
+
+    assert len(successes) == 1
+    assert len(exceptions) == 1
+    assert isinstance(exceptions[0], ConflictingCandleError)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_batch_insertion_idempotent(repo: PostgresCandleRepository) -> None:
+    """Ensure concurrent batch insertions are idempotent and do not fail with unhandled errors."""
+    t0 = datetime(2026, 11, 7, 0, 0, tzinfo=UTC)
+    batch = tuple(make_candle(open_time=t0 + timedelta(hours=i)) for i in range(5))
+
+    results = await asyncio.gather(
+        repo.save_batch(batch),
+        repo.save_batch(batch),
+        return_exceptions=True,
+    )
+
+    for r in results:
+        assert isinstance(r, int)
+
+    stored = await repo.get_candles_by_range(symbol="BTC/USDT", timeframe=TimeFrame.H1)
+    assert len(stored) == 5

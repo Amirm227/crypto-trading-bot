@@ -6,9 +6,12 @@ conflict rejection, deterministic ordering, and gap detection conforming to Cand
 
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
-from typing import TypeVar
+from typing import Any, TypeVar, cast
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from trading_bot.domain.candle import Candle
@@ -22,6 +25,7 @@ from trading_bot.market_data.contracts import (
 )
 from trading_bot.persistence.database import DatabaseManager
 from trading_bot.persistence.exceptions import (
+    BatchHomogeneityError,
     CandleRepositoryError,
     ConflictingCandleError,
 )
@@ -33,6 +37,42 @@ def _ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
+
+
+def _candle_to_dict(candle: Candle) -> dict[str, Any]:
+    """Convert domain candle to dictionary for exact persistence insertion."""
+    return {
+        "exchange": candle.exchange,
+        "symbol": candle.symbol,
+        "market_type": candle.market_type.value,
+        "timeframe": candle.timeframe.value,
+        "open_time": _ensure_utc(candle.open_time),
+        "close_time": _ensure_utc(candle.close_time),
+        "open": candle.open,
+        "high": candle.high,
+        "low": candle.low,
+        "close": candle.close,
+        "volume": candle.volume,
+        "is_closed": candle.is_closed,
+        "ingested_at": _ensure_utc(candle.ingested_at),
+    }
+
+
+UNIQUE_CANDLE_KEYS = ["exchange", "symbol", "market_type", "timeframe", "open_time"]
+
+
+def _build_upsert_stmt(dialect_name: str, values: dict[str, Any] | list[dict[str, Any]]) -> Any:
+    """Construct dialect-specific atomic INSERT ... ON CONFLICT DO NOTHING statement."""
+    if dialect_name == "postgresql":
+        pg_stmt = pg_insert(CandleModel).values(values)
+        return pg_stmt.on_conflict_do_nothing(index_elements=UNIQUE_CANDLE_KEYS)
+    elif dialect_name == "sqlite":
+        sq_stmt = sqlite_insert(CandleModel).values(values)
+        return sq_stmt.on_conflict_do_nothing(index_elements=UNIQUE_CANDLE_KEYS)
+    else:
+        from sqlalchemy import insert
+
+        return insert(CandleModel).values(values)
 
 
 T = TypeVar("T")
@@ -71,19 +111,32 @@ class PostgresCandleRepository(CandleRepository):
         If a candle with identical unique keys and values exists, does nothing.
         If a candle with identical unique keys but conflicting values exists,
         raises ConflictingCandleError and rejects modification.
+        Handles PostgreSQL unique-constraint race conditions safely using native ON CONFLICT.
         """
 
         async def _save(s: AsyncSession) -> None:
             norm_open_time = _ensure_utc(candle.open_time)
-            stmt = select(CandleModel).where(
+            # 1. Optimistic insert using dialect ON CONFLICT DO NOTHING
+            dialect_name = s.bind.dialect.name if s.bind else "postgresql"
+            val = _candle_to_dict(candle)
+            stmt = _build_upsert_stmt(dialect_name, val)
+            res = await s.execute(stmt)
+
+            cursor_res = cast(CursorResult[Any], res)
+            if cursor_res.rowcount is not None and cursor_res.rowcount > 0:
+                return
+
+            # 2. Row already exists or concurrent transaction inserted it.
+            # Query existing row to check if identical or conflicting.
+            q_stmt = select(CandleModel).where(
                 CandleModel.exchange == candle.exchange,
                 CandleModel.symbol == candle.symbol,
                 CandleModel.market_type == candle.market_type.value,
                 CandleModel.timeframe == candle.timeframe.value,
                 CandleModel.open_time == norm_open_time,
             )
-            result = await s.execute(stmt)
-            existing = result.scalars().first()
+            existing_res = await s.execute(q_stmt)
+            existing = existing_res.scalars().first()
 
             if existing is not None:
                 if existing.is_identical(candle):
@@ -96,10 +149,6 @@ class PostgresCandleRepository(CandleRepository):
                     f"(open={candle.open}, high={candle.high}, low={candle.low}, "
                     f"close={candle.close}, volume={candle.volume})"
                 )
-
-            model = CandleModel.from_domain(candle)
-            s.add(model)
-            await s.flush()
 
         try:
             await self._execute_in_session(session, _save)
@@ -116,15 +165,27 @@ class PostgresCandleRepository(CandleRepository):
         """Persist a collection of candles atomically.
 
         Returns the number of newly inserted records.
+        Enforces batch homogeneity: all candles must share (exchange, symbol, market_type, timeframe).
         Skips identical duplicates idempotently.
-        If any candle in the batch conflicts with existing records, the entire transaction
-        is rolled back and ConflictingCandleError is raised.
+        If any candle in the batch conflicts with existing records or within the batch itself,
+        the entire transaction is rolled back and ConflictingCandleError is raised.
         """
         candles = batch.candles if isinstance(batch, CandleBatch) else tuple(batch)
         if not candles:
             return 0
 
-        # Validate internal batch uniqueness and consistency
+        # 1. Enforce batch homogeneity across all candles
+        first = candles[0]
+        first_series = (first.exchange, first.symbol, first.market_type, first.timeframe)
+        for idx, c in enumerate(candles[1:], start=1):
+            c_series = (c.exchange, c.symbol, c.market_type, c.timeframe)
+            if c_series != first_series:
+                raise BatchHomogeneityError(
+                    f"Batch homogeneity violation: all candles in a batch must belong to the same series. "
+                    f"Expected {first_series}, but candle at index {idx} has {c_series}."
+                )
+
+        # 2. Validate internal batch uniqueness and consistency
         seen_keys: dict[tuple[str, str, str, str, datetime], Candle] = {}
         deduped_candles: list[Candle] = []
 
@@ -145,7 +206,7 @@ class PostgresCandleRepository(CandleRepository):
                     raise ConflictingCandleError(
                         f"Conflicting duplicate candles found within input batch for key {key}"
                     )
-                # Identical intra-batch duplicate: keep first occurrence
+                # Identical intra-batch duplicate: keep first occurrence deterministically
                 continue
             seen_keys[key] = c
             deduped_candles.append(c)
@@ -156,19 +217,19 @@ class PostgresCandleRepository(CandleRepository):
             market_type = deduped_candles[0].market_type.value
             timeframe = deduped_candles[0].timeframe.value
 
-            # Query existing records for all timestamps in the batch
+            # First, check for historical conflicts against existing records
             timestamps = [_ensure_utc(c.open_time) for c in deduped_candles]
-            stmt = select(CandleModel).where(
+            stmt_query = select(CandleModel).where(
                 CandleModel.exchange == exchange,
                 CandleModel.symbol == symbol,
                 CandleModel.market_type == market_type,
                 CandleModel.timeframe == timeframe,
                 CandleModel.open_time.in_(timestamps),
             )
-            result = await s.execute(stmt)
+            result = await s.execute(stmt_query)
             existing_map = {_ensure_utc(m.open_time): m for m in result.scalars().all()}
 
-            models_to_insert: list[CandleModel] = []
+            candles_to_insert: list[Candle] = []
             for candle in deduped_candles:
                 norm_open = _ensure_utc(candle.open_time)
                 if norm_open in existing_map:
@@ -182,20 +243,47 @@ class PostgresCandleRepository(CandleRepository):
                             f"vs incoming (open={candle.open}, high={candle.high}, "
                             f"low={candle.low}, close={candle.close}, volume={candle.volume})"
                         )
-                    # Identical duplicate: skip insertion
+                    # Identical duplicate: skip
                     continue
+                candles_to_insert.append(candle)
 
-                models_to_insert.append(CandleModel.from_domain(candle))
+            if not candles_to_insert:
+                return 0
 
-            if models_to_insert:
-                s.add_all(models_to_insert)
-                await s.flush()
+            # Insert new candles using dialect ON CONFLICT DO NOTHING
+            dialect_name = s.bind.dialect.name if s.bind else "postgresql"
+            vals = [_candle_to_dict(c) for c in candles_to_insert]
+            insert_stmt = _build_upsert_stmt(dialect_name, vals)
+            res = await s.execute(insert_stmt)
+            cursor_res = cast(CursorResult[Any], res)
+            rowcount = cursor_res.rowcount
+            inserted_count = (
+                rowcount if rowcount is not None and rowcount >= 0 else len(candles_to_insert)
+            )
 
-            return len(models_to_insert)
+            # If fewer rows were inserted than attempted, verify concurrent duplicate vs conflict
+            if inserted_count < len(candles_to_insert):
+                post_res = await s.execute(stmt_query)
+                current_map = {_ensure_utc(m.open_time): m for m in post_res.scalars().all()}
+                for candle in candles_to_insert:
+                    norm_open = _ensure_utc(candle.open_time)
+                    if norm_open in current_map:
+                        cur = current_map[norm_open]
+                        if not cur.is_identical(candle):
+                            raise ConflictingCandleError(
+                                f"Conflicting candle in batch for {candle.exchange} {candle.symbol} "
+                                f"{candle.market_type} {candle.timeframe} at {candle.open_time}: "
+                                f"existing (open={cur.open}, high={cur.high}, "
+                                f"low={cur.low}, close={cur.close}, volume={cur.volume}) "
+                                f"vs incoming (open={candle.open}, high={candle.high}, "
+                                f"low={candle.low}, close={candle.close}, volume={candle.volume})"
+                            )
+
+            return inserted_count
 
         try:
             return await self._execute_in_session(session, _save_batch)
-        except ConflictingCandleError:
+        except (ConflictingCandleError, BatchHomogeneityError):
             raise
         except Exception as e:
             raise CandleRepositoryError(f"Failed to persist candle batch: {e}") from e

@@ -68,14 +68,6 @@ class CandleModel(Base):
             name="uq_candles_series_open_time",
         ),
         Index(
-            "ix_candles_query",
-            "exchange",
-            "symbol",
-            "market_type",
-            "timeframe",
-            "open_time",
-        ),
-        Index(
             "ix_candles_latest",
             "exchange",
             "symbol",
