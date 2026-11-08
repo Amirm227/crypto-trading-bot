@@ -54,21 +54,42 @@ async def pg_db_manager() -> AsyncIterator[DatabaseManager]:
     alembic_cfg = Config("alembic.ini")
     alembic_cfg.set_main_option("sqlalchemy.url", POSTGRES_TEST_URL)
 
-    # Clean existing test tables safely if previously left over
-    async with db.session() as s:
-        await s.execute(text("DROP TABLE IF EXISTS candles CASCADE"))
-        await s.execute(text("DROP TABLE IF EXISTS alembic_version CASCADE"))
+    # 3. Verify target database has no pre-existing schema or conflicting migration state
+    # Fail safely with an actionable error rather than executing destructive unconditional raw SQL.
+    async with db.engine.connect() as conn:
 
-    # 3. Exercise actual Alembic migration upgrade to HEAD
+        def _check_clean_state(sync_conn: Any) -> None:
+            inspector = inspect(sync_conn)
+            tables = set(inspector.get_table_names())
+            if "candles" in tables:
+                raise RuntimeError(
+                    f"Target test database '{db.engine.url.database}' contains unexpected pre-existing "
+                    "table 'candles'. Integration tests require a clean, dedicated test database without "
+                    "pre-existing schema. Refusing to execute destructive raw SQL or overwrite existing tables."
+                )
+            if "alembic_version" in tables:
+                result = sync_conn.execute(text("SELECT version_num FROM alembic_version"))
+                revisions = [row[0] for row in result]
+                if revisions:
+                    raise RuntimeError(
+                        f"Target test database '{db.engine.url.database}' has pre-existing migration state "
+                        f"(revisions: {revisions}). Integration tests require a database at migration base. "
+                        "Refusing to execute destructive raw SQL or overwrite existing tables."
+                    )
+
+        await conn.run_sync(_check_clean_state)
+
+    # 4. Exercise actual Alembic migration upgrade to HEAD
     command.upgrade(alembic_cfg, "head")
 
-    # 4. Verify migration created expected schema and constraints on live PostgreSQL
+    # 5. Verify migration created expected schema and constraints on live PostgreSQL
     async with db.engine.connect() as conn:
 
         def _inspect_schema(sync_conn: Any) -> None:
             inspector = inspect(sync_conn)
             tables = inspector.get_table_names()
             assert "candles" in tables
+            assert "alembic_version" in tables
             # Verify unique constraint
             uqs = inspector.get_unique_constraints("candles")
             uq_names = {u["name"] for u in uqs}
@@ -83,13 +104,14 @@ async def pg_db_manager() -> AsyncIterator[DatabaseManager]:
 
     yield db
 
-    # 5. Safe teardown: Exercise actual Alembic downgrade
+    # 6. Safe teardown: Exercise actual Alembic downgrade
     try:
         command.downgrade(alembic_cfg, "base")
-    except Exception:
-        async with db.session() as s:
-            await s.execute(text("DROP TABLE IF EXISTS candles CASCADE"))
-            await s.execute(text("DROP TABLE IF EXISTS alembic_version CASCADE"))
+    except Exception as e:
+        raise RuntimeError(
+            f"Alembic migration downgrade failed during test fixture teardown: {e}. "
+            "Refusing to execute destructive raw SQL fallback."
+        ) from e
     finally:
         await db.close()
 
@@ -138,7 +160,7 @@ async def test_postgres_live_persistence_and_idempotency(pg_db_manager: Database
         open=Decimal("70123.45000000"),
         high=Decimal("70500.00000000"),
         low=Decimal("69800.00000000"),
-        close=Decimal("70999.99000000"),
+        close=Decimal("70400.00000000"),
         volume=Decimal("150.25000000"),
         is_closed=True,
         ingested_at=t0 + timedelta(hours=1, seconds=1),

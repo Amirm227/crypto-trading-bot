@@ -4,6 +4,7 @@ Manages AsyncEngine connection pooling, transactional session boundaries,
 and connection health checks for PostgreSQL (and local test runners).
 """
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -25,16 +26,25 @@ from trading_bot.persistence.exceptions import (
 )
 from trading_bot.persistence.models import Base
 
+TEST_TOKEN_REGEX = re.compile(r"(^|[._\-])test([._\-]|$)", re.IGNORECASE)
+PROD_TOKEN_REGEX = re.compile(r"(^|[._\-])(prod|production)([._\-]|$)", re.IGNORECASE)
+
 DANGEROUS_TARGET_DATABASES: frozenset[str] = frozenset(
     {"trading_bot", "postgres", "production", "prod", "main", "master", "default"}
 )
 
 
 def validate_test_database_url(database_url: str) -> None:
-    """Validate that a database URL is an explicitly isolated test target.
+    """Validate that a database URL is an explicitly isolated PostgreSQL test target.
 
-    Rejects production, default, or ambiguous database names to prevent destructive operations
-    against real databases during test execution.
+    Enforces strict safety boundaries before running destructive integration tests:
+    1. Driver must be PostgreSQL (e.g. 'postgresql+asyncpg'). Every non-PostgreSQL URL
+       (including SQLite memory and file URLs) is rejected.
+    2. Target database name must not match known default or production databases.
+    3. Target database name must not contain 'prod' or 'production' tokens.
+    4. Target database name must contain 'test' as a distinct delimited token (e.g.
+       'trading_bot_test', 'test_db', 'ci-test-run'). Substring collisions such as
+       'contest' or 'latest' are strictly rejected.
     """
     if not database_url or not database_url.strip():
         raise UnsafeDatabaseTargetError("Database URL for integration test cannot be empty.")
@@ -44,9 +54,13 @@ def validate_test_database_url(database_url: str) -> None:
     except Exception as e:
         raise UnsafeDatabaseTargetError(f"Malformed database URL: {e}") from e
 
-    # SQLite is permitted for local isolated testing
-    if url_obj.drivername.startswith("sqlite"):
-        return
+    # 1. Reject every non-PostgreSQL URL (including SQLite)
+    driver = url_obj.drivername.lower()
+    if not (driver.startswith("postgresql") or driver.startswith("postgres")):
+        raise UnsafeDatabaseTargetError(
+            f"Unsafe database target for PostgreSQL integration tests: unsupported driver '{url_obj.drivername}'. "
+            "Only PostgreSQL connection URLs (e.g., 'postgresql+asyncpg://...') are permitted."
+        )
 
     db_name = url_obj.database
     if not db_name or not db_name.strip():
@@ -56,16 +70,18 @@ def validate_test_database_url(database_url: str) -> None:
 
     db_lower = db_name.strip().lower()
 
-    if db_lower in DANGEROUS_TARGET_DATABASES:
+    if db_lower in DANGEROUS_TARGET_DATABASES or PROD_TOKEN_REGEX.search(db_lower):
         raise UnsafeDatabaseTargetError(
             f"Unsafe database target for destructive integration tests: '{db_name}'. "
             f"Target database cannot be a production or default database ({sorted(DANGEROUS_TARGET_DATABASES)})."
         )
 
-    if "test" not in db_lower:
+    # 2. Require 'test' as a distinct token (separated by '.', '_', '-', or string boundaries)
+    if not TEST_TOKEN_REGEX.search(db_lower):
         raise UnsafeDatabaseTargetError(
             f"Unsafe database target for destructive integration tests: '{db_name}'. "
-            f"The database name must explicitly contain 'test' (e.g. 'trading_bot_test')."
+            "The database name must contain 'test' as a distinct token (e.g., 'trading_bot_test', 'test_db'). "
+            "Names with substring collisions (such as 'contest' or 'latest') are rejected."
         )
 
 
